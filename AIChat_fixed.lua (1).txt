@@ -1,0 +1,976 @@
+--!nocheck
+-- AIChat FIXED - Versão compatível Delta / Fluxus / Synapse / Mobile
+-- Correções: parent robusto, sem chamadas nil no top-level, pcall em tudo, cloneref, protect_gui, fallback PlayerGui
+-- Use no EXECUTOR (botão Execute), NÃO como LocalScript no Studio.
+
+local function safeGetService(name)
+    local ok, svc = pcall(function() return game:GetService(name) end)
+    if ok then return svc end
+    return nil
+end
+
+local Players = safeGetService("Players")
+local HttpService = safeGetService("HttpService")
+local TweenService = safeGetService("TweenService")
+local UserInputService = safeGetService("UserInputService")
+local CoreGui = safeGetService("CoreGui")
+
+local LocalPlayer = nil
+pcall(function() LocalPlayer = Players and Players.LocalPlayer or nil end)
+
+-- cloneref para bypass (Delta, Fluxus)
+local cloneref = cloneref or function(o) return o end
+pcall(function()
+    if getgenv and getgenv().cloneref then cloneref = getgenv().cloneref end
+end)
+
+-- gethui robusto
+local function getParentGui()
+    -- 1. gethui / get_hidden_gui
+    local ok, hui = pcall(function()
+        local f = rawget(getfenv(), "gethui") or (getgenv and rawget(getgenv(), "gethui"))
+        if typeof(f) == "function" then return f() end
+        local f2 = rawget(getfenv(), "get_hidden_gui") or (getgenv and rawget(getgenv(), "get_hidden_gui"))
+        if typeof(f2) == "function" then return f2() end
+        return nil
+    end)
+    if ok and hui and typeof(hui) == "Instance" then
+        pcall(function() 
+            if syn and syn.protect_gui then syn.protect_gui(hui) end
+        end)
+        return hui
+    end
+    -- 2. CoreGui com cloneref
+    local ok2, cg = pcall(function() return cloneref(CoreGui) end)
+    if ok2 and cg then
+        local testOk = pcall(function()
+            local sg = Instance.new("ScreenGui")
+            sg.Name = "AIChat_Test"
+            sg.Parent = cg
+            sg:Destroy()
+        end)
+        if testOk then return cg end
+    end
+    -- 3. PlayerGui
+    if LocalPlayer then
+        local ok3, pg = pcall(function() return LocalPlayer:FindFirstChildOfClass("PlayerGui") or LocalPlayer:WaitForChild("PlayerGui", 2) end)
+        if ok3 and pg then return pg end
+    end
+    -- 4. CoreGui direto
+    if CoreGui then return CoreGui end
+    return nil
+end
+
+-- Detecta funções executoras sem chamar nil
+local function detectRequest()
+    local names = {"request", "http_request"}
+    for _, n in ipairs(names) do
+        local ok, v = pcall(function() return rawget(getfenv(), n) end)
+        if ok and typeof(v) == "function" then return v end
+        local ok2, v2 = pcall(function() return getgenv and rawget(getgenv(), n) end)
+        if ok2 and typeof(v2) == "function" then return v2 end
+    end
+    local ok, v = pcall(function() return syn and syn.request end)
+    if ok and typeof(v) == "function" then return v end
+    local ok2, v2 = pcall(function() return http and http.request end)
+    if ok2 and typeof(v2) == "function" then return v2 end
+    local ok3, v3 = pcall(function() return fluxus and fluxus.request end)
+    if ok3 and typeof(v3) == "function" then return v3 end
+    return nil
+end
+
+local function detectClipboard()
+    local names = {"setclipboard", "toclipboard", "set_clipboard"}
+    for _, n in ipairs(names) do
+        local ok, v = pcall(function() return rawget(getfenv(), n) end)
+        if ok and typeof(v) == "function" then return v end
+        local ok2, v2 = pcall(function() return getgenv and rawget(getgenv(), n) end)
+        if ok2 and typeof(v2) == "function" then return v2 end
+    end
+    local ok, v = pcall(function() return Clipboard and Clipboard.set end)
+    if ok and typeof(v) == "function" then return v end
+    return nil
+end
+
+local function hasFileFuncs()
+    local ok1 = pcall(function() return typeof(isfolder) == "function" end)
+    if not ok1 then return false end
+    local a,b,c,d = false,false,false,false
+    pcall(function() a = typeof(isfolder) == "function" end)
+    pcall(function() b = typeof(isfile) == "function" end)
+    pcall(function() c = typeof(readfile) == "function" end)
+    pcall(function() d = typeof(writefile) == "function" end)
+    return a and b and c and d
+end
+
+-- Config
+local ACCENT = Color3.fromRGB(255,132,0)
+local BG = Color3.fromRGB(15,15,15)
+local BG2 = Color3.fromRGB(22,22,22)
+local BG3 = Color3.fromRGB(30,30,30)
+local TXT = Color3.fromRGB(240,240,240)
+local TXTDIM = Color3.fromRGB(160,160,160)
+
+local Config = {}
+Config.Providers = {"OpenAI","Google Gemini","DeepSeek","Anthropic","Qwen","Mistral","Meta / Llama","xAI / Grok","OpenRouter","Outros"}
+Config.ProviderAPIUrls = {
+    ["OpenAI"] = "https://api.openai.com/v1/chat/completions",
+    ["Google Gemini"] = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+    ["DeepSeek"] = "https://api.deepseek.com/chat/completions",
+    ["Anthropic"] = "https://api.anthropic.com/v1/messages",
+    ["Qwen"] = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions",
+    ["Mistral"] = "https://api.mistral.ai/v1/chat/completions",
+    ["Meta / Llama"] = "https://api.llama.com/compat/v1/chat/completions",
+    ["xAI / Grok"] = "https://api.x.ai/v1/chat/completions",
+    ["OpenRouter"] = "https://openrouter.ai/api/v1/chat/completions",
+    ["Outros"] = "",
+}
+Config.ModelsCatalog = {
+    ["OpenAI"] = {
+        {id="gpt-4o", name="GPT-4o", price="Paid"},
+        {id="gpt-4o-mini", name="GPT-4o Mini", price="Paid"},
+        {id="gpt-4-turbo", name="GPT-4 Turbo", price="Paid"},
+        {id="gpt-3.5-turbo", name="GPT-3.5 Turbo", price="Paid"},
+        {id="o1", name="o1", price="Paid"},
+        {id="o3-mini", name="o3 Mini", price="Paid"},
+    },
+    ["Google Gemini"] = {
+        {id="gemini-2.0-flash", name="Gemini 2.0 Flash", price="Paid"},
+        {id="gemini-1.5-pro", name="Gemini 1.5 Pro", price="Paid"},
+        {id="gemini-1.5-flash", name="Gemini 1.5 Flash", price="Paid"},
+    },
+    ["DeepSeek"] = {
+        {id="deepseek-chat", name="DeepSeek Chat V3", price="Paid"},
+        {id="deepseek-reasoner", name="DeepSeek Reasoner R1", price="Paid"},
+    },
+    ["Anthropic"] = {
+        {id="claude-3-5-sonnet-20241022", name="Claude 3.5 Sonnet", price="Paid"},
+        {id="claude-3-5-haiku-20241022", name="Claude 3.5 Haiku", price="Paid"},
+    },
+    ["Qwen"] = {
+        {id="qwen-max", name="Qwen Max", price="Paid"},
+        {id="qwen-plus", name="Qwen Plus", price="Paid"},
+    },
+    ["Mistral"] = {
+        {id="mistral-large-latest", name="Mistral Large", price="Paid"},
+        {id="mistral-small-latest", name="Mistral Small", price="Paid"},
+    },
+    ["Meta / Llama"] = {
+        {id="meta-llama/Llama-3.3-70B-Instruct", name="Llama 3.3 70B", price="Paid"},
+        {id="llama-3.3-70b-versatile", name="Llama 3.3 70B Versatile", price="Paid"},
+    },
+    ["xAI / Grok"] = {
+        {id="grok-2-latest", name="Grok 2", price="Paid"},
+        {id="grok-3", name="Grok 3", price="Paid"},
+    },
+    ["OpenRouter"] = {},
+    ["Outros"] = {},
+}
+Config.RScriptsBase = "https://api.rscripts.net"
+
+-- State
+local State = {
+    profiles = {},
+    activeProfileId = nil,
+    systemPrompt = "",
+    rscriptsApiKey = "",
+    favorites = {},
+    customModels = {},
+    chatHistory = {},
+    visual = {accent=ACCENT, transparency=0.15, scale=1, fontSize=14, rounding=6, animations=true},
+    previousSize = nil,
+}
+
+-- Storage
+local Storage = {Folder="AIChat", File="AIChat/config.json"}
+function Storage:load()
+    if not hasFileFuncs() then return end
+    local ok, exists = pcall(function() return isfile(self.File) end)
+    if not ok or not exists then return end
+    local ok2, content = pcall(function() return readfile(self.File) end)
+    if not ok2 then return end
+    local ok3, decoded = pcall(function() return HttpService:JSONDecode(content) end)
+    if not ok3 or not decoded then return end
+    if decoded.profiles then State.profiles = decoded.profiles end
+    if decoded.activeProfileId then State.activeProfileId = decoded.activeProfileId end
+    if decoded.systemPrompt ~= nil then State.systemPrompt = decoded.systemPrompt end
+    if decoded.rscriptsApiKey ~= nil then State.rscriptsApiKey = decoded.rscriptsApiKey end
+    if decoded.favorites then State.favorites = decoded.favorites end
+    if decoded.customModels then State.customModels = decoded.customModels end
+    if decoded.visual then
+        if decoded.visual.accent then
+            local c = decoded.visual.accent
+            pcall(function() State.visual.accent = Color3.fromRGB(c.r,c.g,c.b) end)
+        end
+        if decoded.visual.transparency then State.visual.transparency = decoded.visual.transparency end
+        if decoded.visual.scale then State.visual.scale = decoded.visual.scale end
+        if decoded.visual.fontSize then State.visual.fontSize = decoded.visual.fontSize end
+        if decoded.visual.rounding then State.visual.rounding = decoded.visual.rounding end
+        if decoded.visual.animations ~= nil then State.visual.animations = decoded.visual.animations end
+    end
+end
+function Storage:save()
+    if not hasFileFuncs() then return false end
+    pcall(function() if not isfolder(self.Folder) then makefolder(self.Folder) end end)
+    local toSave = {
+        profiles = State.profiles,
+        activeProfileId = State.activeProfileId,
+        systemPrompt = State.systemPrompt,
+        rscriptsApiKey = State.rscriptsApiKey,
+        favorites = State.favorites,
+        customModels = State.customModels,
+        visual = {
+            accent = {r=math.floor(State.visual.accent.R*255), g=math.floor(State.visual.accent.G*255), b=math.floor(State.visual.accent.B*255)},
+            transparency = State.visual.transparency,
+            scale = State.visual.scale,
+            fontSize = State.visual.fontSize,
+            rounding = State.visual.rounding,
+            animations = State.visual.animations,
+        }
+    }
+    local ok, json = pcall(function() return HttpService:JSONEncode(toSave) end)
+    if not ok then return false end
+    local ok2 = pcall(function() writefile(self.File, json) end)
+    return ok2
+end
+
+-- HTTP
+local requestFunc = detectRequest()
+local clipboardFunc = detectClipboard()
+
+local function httpRequest(opts)
+    if requestFunc then
+        local ok, res = pcall(function() return requestFunc(opts) end)
+        if ok and res then
+            if typeof(res) == "string" then return {Success=true, StatusCode=200, Body=res} end
+            return {Success=res.Success~=false, StatusCode=res.StatusCode or 200, Body=res.Body or "", Headers=res.Headers or {}}
+        end
+    end
+    -- fallback RequestAsync (só GET funciona sem HttpEnabled em alguns jogos)
+    local ok, res = pcall(function()
+        return HttpService:RequestAsync({Url=opts.Url, Method=opts.Method or "GET", Headers=opts.Headers or {}, Body=opts.Body})
+    end)
+    if ok and res then return {Success=res.Success, StatusCode=res.StatusCode, Body=res.Body} end
+    return {Success=false, StatusCode=0, Body="HTTP não disponível neste ambiente."}
+end
+
+-- Helpers GUI
+local function corner(p,r) local c=Instance.new("UICorner") c.CornerRadius=UDim.new(0,r or State.visual.rounding) c.Parent=p return c end
+local function stroke(p,col,th) local s=Instance.new("UIStroke") s.Color=col or State.visual.accent s.Thickness=th or 1 s.ApplyStrokeMode=Enum.ApplyStrokeMode.Border s.Parent=p return s end
+local function btn(parent,text,size,bg)
+    local b=Instance.new("TextButton") b.Size=size or UDim2.new(0,80,0,28) b.BackgroundColor3=bg or State.visual.accent b.Text=text b.TextColor3=Color3.new(1,1,1) b.TextSize=State.visual.fontSize b.Font=Enum.Font.GothamSemibold b.Parent=parent corner(b,6) return b
+end
+local function lbl(parent,text,size,sz,col,align)
+    local l=Instance.new("TextLabel") l.Size=size or UDim2.new(1,0,0,20) l.BackgroundTransparency=1 l.Text=text or "" l.TextColor3=col or TXT l.TextSize=sz or State.visual.fontSize l.Font=Enum.Font.Gotham l.TextXAlignment=align or Enum.TextXAlignment.Left l.TextWrapped=true l.Parent=parent return l
+end
+local function tbox(parent,ph,size,multi)
+    local t=Instance.new("TextBox") t.Size=size or UDim2.new(1,0,0,28) t.BackgroundColor3=BG3 t.Text="" t.PlaceholderText=ph or "" t.TextColor3=TXT t.PlaceholderColor3=TXTDIM t.TextSize=State.visual.fontSize t.Font=Enum.Font.Gotham t.TextXAlignment=Enum.TextXAlignment.Left t.ClearTextOnFocus=false t.TextWrapped=multi or false t.MultiLine=multi or false t.Parent=parent corner(t,6) stroke(t,BG3,1) return t
+end
+
+-- AI Client
+local function getActiveProfile()
+    if not State.activeProfileId then return nil end
+    for _,p in ipairs(State.profiles) do if p.id==State.activeProfileId then return p end end
+    return nil
+end
+local function validateProfile(p)
+    if not p then return false, "Configure a IA que você vai usar nas configurações." end
+    if not p.API_URL or p.API_URL=="" then return false, "Configure a IA que você vai usar nas configurações." end
+    if not p.API_KEY or p.API_KEY=="" then return false, "Configure a IA que você vai usar nas configurações." end
+    if not p.MODEL or p.MODEL=="" then return false, "Selecione um modelo nas configurações." end
+    return true
+end
+
+-- RScripts Client (oficial)
+local function rscriptsRequest(endpoint, params)
+    if not State.rscriptsApiKey or State.rscriptsApiKey=="" then return false, "Configure sua RScripts API Key nas configurações." end
+    local url = Config.RScriptsBase..endpoint
+    if params and next(params) then
+        local qs={}
+        for k,v in pairs(params) do if v~=nil and v~="" then table.insert(qs, HttpService:UrlEncode(k).."="..HttpService:UrlEncode(tostring(v))) end end
+        if #qs>0 then url=url.."?"..table.concat(qs,"&") end
+    end
+    local res = httpRequest({Url=url, Method="GET", Headers={["Authorization"]="Bearer "..State.rscriptsApiKey}})
+    if not res.Success then
+        local code=res.StatusCode or 0
+        if code==401 then return false, "RScripts API Key inválida (401)." end
+        if code==429 then return false, "Rate limit RScripts (429)." end
+        return false, "Erro RScripts HTTP ("..code.."): "..tostring(res.Body):sub(1,200)
+    end
+    local ok, dec = pcall(function() return HttpService:JSONDecode(res.Body) end)
+    if not ok then return false, "Resposta RScripts inválida (JSON)." end
+    if dec.success==false then return false, "RScripts erro: "..tostring(dec.error and dec.error.message or "desconhecido") end
+    return true, dec
+end
+
+-- Main GUI
+local function createGui()
+    local parentGui = getParentGui()
+    if not parentGui then
+        warn("[AIChat] Não foi possível encontrar parent GUI (CoreGui/PlayerGui).")
+        return nil
+    end
+
+    -- remove old
+    pcall(function() if parentGui:FindFirstChild("AIChat") then parentGui:FindFirstChild("AIChat"):Destroy() end end)
+
+    local sg = Instance.new("ScreenGui")
+    sg.Name = "AIChat"
+    sg.ResetOnSpawn = false
+    sg.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    sg.IgnoreGuiInset = true
+    sg.Parent = parentGui
+
+    local main = Instance.new("Frame")
+    main.Name = "MainFrame"
+    main.Size = UDim2.new(0,520,0,360) -- mais baixa e compacta
+    main.Position = UDim2.new(0.5,-260,0.6,-180) -- mais baixa
+    main.BackgroundColor3 = BG
+    main.BackgroundTransparency = State.visual.transparency
+    main.BorderSizePixel = 0
+    main.Parent = sg
+    corner(main, State.visual.rounding+2)
+    local mainStroke = stroke(main, State.visual.accent, 1.2)
+
+    local uiScale = Instance.new("UIScale")
+    uiScale.Scale = State.visual.scale
+    uiScale.Parent = main
+
+    local topBar = Instance.new("Frame")
+    topBar.Size = UDim2.new(1,0,0,32)
+    topBar.BackgroundColor3 = BG2
+    topBar.BorderSizePixel = 0
+    topBar.Parent = main
+    corner(topBar, State.visual.rounding)
+    local topFix = Instance.new("Frame")
+    topFix.Size = UDim2.new(1,0,0,10)
+    topFix.Position = UDim2.new(0,0,1,-10)
+    topFix.BackgroundColor3 = BG2
+    topFix.BorderSizePixel = 0
+    topFix.Parent = topBar
+
+    local title = lbl(topBar, "AIChat", UDim2.new(1,-100,1,0), 15, TXT, Enum.TextXAlignment.Left)
+    title.Position = UDim2.new(0,12,0,0)
+    title.Font = Enum.Font.GothamBold
+
+    local btnMin = btn(topBar, "-", UDim2.new(0,28,0,22), BG3)
+    btnMin.Position = UDim2.new(1,-62,0,5)
+    local btnClose = btn(topBar, "X", UDim2.new(0,28,0,22), Color3.fromRGB(180,40,40))
+    btnClose.Position = UDim2.new(1,-30,0,5)
+
+    local tabsBar = Instance.new("Frame")
+    tabsBar.Size = UDim2.new(1,0,0,32)
+    tabsBar.Position = UDim2.new(0,0,0,32)
+    tabsBar.BackgroundColor3 = BG2
+    tabsBar.BorderSizePixel = 0
+    tabsBar.Parent = main
+    local tabsLayout = Instance.new("UIListLayout")
+    tabsLayout.FillDirection = Enum.FillDirection.Horizontal
+    tabsLayout.Padding = UDim.new(0,4)
+    tabsLayout.Parent = tabsBar
+    local tabsPad = Instance.new("UIPadding")
+    tabsPad.PaddingLeft = UDim.new(0,6)
+    tabsPad.PaddingTop = UDim.new(0,4)
+    tabsPad.PaddingBottom = UDim.new(0,4)
+    tabsPad.Parent = tabsBar
+
+    local function makeTab(name, order, w)
+        local b = btn(tabsBar, name, UDim2.new(0,w or 90,1,0), BG3)
+        b.LayoutOrder = order
+        b.TextSize = 13
+        b.TextColor3 = TXTDIM
+        return b
+    end
+    local tabChat = makeTab("Chat",1,90)
+    local tabRScripts = makeTab("RScripts",2,90)
+    local tabSettings = makeTab("Configurações",3,110)
+
+    local content = Instance.new("Frame")
+    content.Size = UDim2.new(1,-12,1,-76)
+    content.Position = UDim2.new(0,6,0,70)
+    content.BackgroundTransparency = 1
+    content.Parent = main
+
+    local pageChat = Instance.new("Frame")
+    pageChat.Size = UDim2.new(1,0,1,0)
+    pageChat.BackgroundTransparency = 1
+    pageChat.Parent = content
+    local pageRScripts = Instance.new("Frame")
+    pageRScripts.Size = UDim2.new(1,0,1,0)
+    pageRScripts.BackgroundTransparency = 1
+    pageRScripts.Visible = false
+    pageRScripts.Parent = content
+    local pageSettings = Instance.new("Frame")
+    pageSettings.Size = UDim2.new(1,0,1,0)
+    pageSettings.BackgroundTransparency = 1
+    pageSettings.Visible = false
+    pageSettings.Parent = content
+
+    local resize = Instance.new("TextButton")
+    resize.Size = UDim2.new(0,20,0,20)
+    resize.Position = UDim2.new(1,-20,1,-20)
+    resize.BackgroundTransparency = 1
+    resize.Text = "◢"
+    resize.TextColor3 = TXTDIM
+    resize.TextSize = 14
+    resize.Font = Enum.Font.GothamBold
+    resize.ZIndex = 10
+    resize.Parent = main
+
+    -- tab switching
+    local function setTab(name)
+        pageChat.Visible = (name=="Chat")
+        pageRScripts.Visible = (name=="RScripts")
+        pageSettings.Visible = (name=="Settings")
+        for _,b in pairs({Chat=tabChat,RScripts=tabRScripts,Settings=tabSettings}) do
+            -- reset
+        end
+        tabChat.BackgroundColor3 = (name=="Chat") and State.visual.accent or BG3
+        tabChat.TextColor3 = (name=="Chat") and Color3.new(1,1,1) or TXTDIM
+        tabRScripts.BackgroundColor3 = (name=="RScripts") and State.visual.accent or BG3
+        tabRScripts.TextColor3 = (name=="RScripts") and Color3.new(1,1,1) or TXTDIM
+        tabSettings.BackgroundColor3 = (name=="Settings") and State.visual.accent or BG3
+        tabSettings.TextColor3 = (name=="Settings") and Color3.new(1,1,1) or TXTDIM
+    end
+    tabChat.MouseButton1Click:Connect(function() setTab("Chat") end)
+    tabRScripts.MouseButton1Click:Connect(function() setTab("RScripts") end)
+    tabSettings.MouseButton1Click:Connect(function() setTab("Settings") end)
+
+    -- close/minimize
+    btnClose.MouseButton1Click:Connect(function() sg:Destroy() end)
+    local minimized=false
+    local prevSize=nil
+    btnMin.MouseButton1Click:Connect(function()
+        minimized = not minimized
+        if minimized then
+            prevSize = main.Size
+            local target = UDim2.new(prevSize.X.Scale, prevSize.X.Offset, 0, 32)
+            if State.visual.animations and TweenService then
+                pcall(function() TweenService:Create(main, TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {Size=target}):Play() end)
+            else
+                main.Size = target
+            end
+            tabsBar.Visible=false content.Visible=false resize.Visible=false
+        else
+            local target = prevSize or UDim2.new(0,520,0,420)
+            if State.visual.animations and TweenService then
+                local tw = TweenService:Create(main, TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {Size=target})
+                tw:Play()
+                tw.Completed:Connect(function() tabsBar.Visible=true content.Visible=true resize.Visible=true end)
+            else
+                main.Size=target tabsBar.Visible=true content.Visible=true resize.Visible=true
+            end
+        end
+    end)
+
+    -- drag
+    do
+        local dragging=false
+        local dragStart, startPos
+        topBar.InputBegan:Connect(function(input)
+            if input.UserInputType==Enum.UserInputType.MouseButton1 or input.UserInputType==Enum.UserInputType.Touch then
+                dragging=true dragStart=input.Position startPos=main.Position
+            end
+        end)
+        topBar.InputChanged:Connect(function(input)
+            if dragging and (input.UserInputType==Enum.UserInputType.MouseMovement or input.UserInputType==Enum.UserInputType.Touch) then
+                local delta=input.Position-dragStart
+                main.Position=UDim2.new(startPos.X.Scale,startPos.X.Offset+delta.X,startPos.Y.Scale,startPos.Y.Offset+delta.Y)
+            end
+        end)
+        if UserInputService then
+            UserInputService.InputChanged:Connect(function(input)
+                if dragging and (input.UserInputType==Enum.UserInputType.MouseMovement or input.UserInputType==Enum.UserInputType.Touch) then
+                    local delta=input.Position-dragStart
+                    main.Position=UDim2.new(startPos.X.Scale,startPos.X.Offset+delta.X,startPos.Y.Scale,startPos.Y.Offset+delta.Y)
+                end
+            end)
+            UserInputService.InputEnded:Connect(function(input)
+                if input.UserInputType==Enum.UserInputType.MouseButton1 or input.UserInputType==Enum.UserInputType.Touch then dragging=false end
+            end)
+        end
+    end
+    -- resize
+    do
+        local resizing=false
+        local rStart, sStart
+        resize.InputBegan:Connect(function(input)
+            if input.UserInputType==Enum.UserInputType.MouseButton1 or input.UserInputType==Enum.UserInputType.Touch then
+                resizing=true rStart=input.Position sStart=main.Size
+            end
+        end)
+        if UserInputService then
+            UserInputService.InputChanged:Connect(function(input)
+                if resizing and (input.UserInputType==Enum.UserInputType.MouseMovement or input.UserInputType==Enum.UserInputType.Touch) then
+                    local delta=input.Position-rStart
+                    local nx=math.max(360, sStart.X.Offset+delta.X)
+                    local ny=math.max(300, sStart.Y.Offset+delta.Y)
+                    main.Size=UDim2.new(0,nx,0,ny)
+                end
+            end)
+            UserInputService.InputEnded:Connect(function(input)
+                if input.UserInputType==Enum.UserInputType.MouseButton1 or input.UserInputType==Enum.UserInputType.Touch then resizing=false end
+            end)
+        end
+    end
+
+    -- ================= Chat Tab =================
+    local selectorRow = Instance.new("Frame")
+    selectorRow.Size = UDim2.new(1,0,0,32)
+    selectorRow.BackgroundTransparency=1
+    selectorRow.Parent=pageChat
+    local selLayout = Instance.new("UIListLayout")
+    selLayout.FillDirection=Enum.FillDirection.Horizontal
+    selLayout.Padding=UDim.new(0,6)
+    selLayout.Parent=selectorRow
+    lbl(selectorRow,"IA:",UDim2.new(0,30,1,0),12,TXTDIM)
+    local profileBtn = btn(selectorRow,"Nenhum perfil",UDim2.new(0,140,0,28),BG3)
+    profileBtn.TextSize=12
+    lbl(selectorRow,"Modelo:",UDim2.new(0,50,1,0),12,TXTDIM)
+    local modelDisplay = lbl(selectorRow,"Selecione um modelo",UDim2.new(0,160,1,0),12,TXT)
+
+    local history = Instance.new("ScrollingFrame")
+    history.Size=UDim2.new(1,0,1,-32-70-8)
+    history.Position=UDim2.new(0,0,0,36)
+    history.BackgroundColor3=BG2
+    history.BackgroundTransparency=0.2
+    history.BorderSizePixel=0
+    history.CanvasSize=UDim2.new(0,0,0,0)
+    history.AutomaticCanvasSize=Enum.AutomaticSize.Y
+    history.ScrollBarThickness=4
+    history.Parent=pageChat
+    corner(history,6) stroke(history,BG3,1)
+    local hLayout=Instance.new("UIListLayout") hLayout.SortOrder=Enum.SortOrder.LayoutOrder hLayout.Padding=UDim.new(0,6) hLayout.Parent=history
+    local hPad=Instance.new("UIPadding") setPadAll(hPad, UDim.new(0,6) hPad.Parent=history)
+
+    local inputArea=Instance.new("Frame") inputArea.Size=UDim2.new(1,0,0,70) inputArea.Position=UDim2.new(0,0,1,-70) inputArea.BackgroundTransparency=1 inputArea.Parent=pageChat
+    local inputBox=tbox(inputArea,"Digite sua mensagem...",UDim2.new(1,-90,0,48),true)
+    inputBox.TextXAlignment=Enum.TextXAlignment.Left inputBox.TextYAlignment=Enum.TextYAlignment.Top
+    local sendBtn=btn(inputArea,"Enviar",UDim2.new(0,80,0,28),State.visual.accent) sendBtn.Position=UDim2.new(1,-80,0,0)
+    local clearBtn=btn(inputArea,"Limpar",UDim2.new(0,80,0,28),BG3) clearBtn.Position=UDim2.new(1,-80,0,32)
+    local statusLbl=lbl(inputArea,"",UDim2.new(1,-90,0,18),11,TXTDIM) statusLbl.Position=UDim2.new(0,0,0,50)
+
+    local dropdownList=Instance.new("ScrollingFrame")
+    dropdownList.Size=UDim2.new(0,200,0,150) dropdownList.Position=UDim2.new(0,40,0,28) dropdownList.BackgroundColor3=BG3 dropdownList.Visible=false dropdownList.ZIndex=20 dropdownList.CanvasSize=UDim2.new(0,0,0,0) dropdownList.AutomaticCanvasSize=Enum.AutomaticSize.Y dropdownList.ScrollBarThickness=4 dropdownList.Parent=selectorRow corner(dropdownList,6) stroke(dropdownList,State.visual.accent,1)
+    local ddLayout=Instance.new("UIListLayout") ddLayout.Parent=dropdownList
+
+    local function refreshProfileDropdown()
+        for _,c in ipairs(dropdownList:GetChildren()) do if c:IsA("TextButton") then c:Destroy() end end
+        for _,p in ipairs(State.profiles) do
+            local b=btn(dropdownList,p.Name.." ("..(p.Provider or "?")..")",UDim2.new(1,-4,0,24),BG2) b.TextSize=12
+            b.MouseButton1Click:Connect(function()
+                State.activeProfileId=p.id profileBtn.Text=p.Name modelDisplay.Text=p.MODEL or "Selecione um modelo" dropdownList.Visible=false Storage:save()
+            end)
+        end
+        if #State.profiles==0 then lbl(dropdownList,"Nenhum perfil",UDim2.new(1,0,0,24),12,TXTDIM) end
+    end
+    profileBtn.MouseButton1Click:Connect(function() refreshProfileDropdown() dropdownList.Visible=not dropdownList.Visible end)
+
+    local function addMessage(role, content, isError)
+        local f=Instance.new("Frame") f.Size=UDim2.new(1,-6,0,0) f.AutomaticSize=Enum.AutomaticSize.Y f.BackgroundColor3=(role=="user") and Color3.fromRGB(28,28,28) or Color3.fromRGB(20,20,20) if isError then f.BackgroundColor3=Color3.fromRGB(60,20,20) end f.BorderSizePixel=0 f.Parent=history corner(f,6) stroke(f,(role=="user") and BG3 or State.visual.accent,1,0.5)
+        local rLbl=lbl(f,(role=="user" and "Usuario" or (isError and "Sistema" or "IA"))..":",UDim2.new(1,-10,0,18),11,(role=="user" and TXTDIM or State.visual.accent)) rLbl.Position=UDim2.new(0,6,0,2) rLbl.Font=Enum.Font.GothamBold
+        local cLbl=lbl(f,content,UDim2.new(1,-12,0,0),State.visual.fontSize,TXT) cLbl.Position=UDim2.new(0,6,0,20) cLbl.AutomaticSize=Enum.AutomaticSize.Y
+        if role~="user" then
+            local cp=btn(f,"Copiar",UDim2.new(0,50,0,20),BG3) cp.Position=UDim2.new(1,-56,0,2) cp.TextSize=11
+            cp.MouseButton1Click:Connect(function()
+                if clipboardFunc then pcall(function() clipboardFunc(content) end) statusLbl.Text="Copiado!" task.delay(2,function() statusLbl.Text="" end)
+                else statusLbl.Text="setclipboard não está disponível neste ambiente." end
+            end)
+        end
+        if isError and content:find("Configure a IA") then
+            local open=btn(f,"Abrir configurações",UDim2.new(0,140,0,24),State.visual.accent) open.Position=UDim2.new(0,6,1,-28) open.TextSize=12
+            open.MouseButton1Click:Connect(function() setTab("Settings") end)
+            local pad=Instance.new("Frame") pad.Size=UDim2.new(1,0,0,30) pad.BackgroundTransparency=1 pad.Parent=f
+        end
+        task.wait() pcall(function() history.CanvasPosition=Vector2.new(0,history.AbsoluteCanvasSize.Y) end)
+    end
+
+    local sending=false
+    local function onSend()
+        if sending then return end
+        local txt=inputBox.Text
+        if not txt or txt:gsub("%s","")=="" then return end
+        local prof=getActiveProfile()
+        local ok, err = validateProfile(prof)
+        if not ok then addMessage("system",err,true) return end
+        addMessage("user",txt)
+        table.insert(State.chatHistory,{role="user",content=txt})
+        inputBox.Text=""
+        sending=true sendBtn.Text="..." statusLbl.Text="Enviando..."
+        task.spawn(function()
+            local messages={}
+            if State.systemPrompt~="" then table.insert(messages,{role="system",content=State.systemPrompt}) end
+            for _,m in ipairs(State.chatHistory) do table.insert(messages,{role=m.role,content=m.content}) end
+            local body=HttpService:JSONEncode({model=prof.MODEL, messages=messages})
+            local res=httpRequest({Url=prof.API_URL, Method="POST", Headers={["Content-Type"]="application/json", ["Authorization"]="Bearer "..prof.API_KEY}, Body=body})
+            sending=false sendBtn.Text="Enviar" statusLbl.Text=""
+            if not res.Success then
+                local code=res.StatusCode or 0
+                local msg=res.Body or ""
+                if code==401 then addMessage("system","API Key inválida (401).",true)
+                elseif code==403 then addMessage("system","Acesso negado (403).",true)
+                elseif code==404 then addMessage("system","Endpoint/modelo não encontrado (404).",true)
+                elseif code==429 then addMessage("system","Rate limit (429).",true)
+                else addMessage("system","Erro HTTP ("..code.."): "..tostring(msg):sub(1,300),true) end
+                return
+            end
+            local ok2, dec = pcall(function() return HttpService:JSONDecode(res.Body) end)
+            if not ok2 or not dec then addMessage("system","Resposta inválida (JSON).",true) return end
+            local content=nil
+            if dec.choices and dec.choices[1] and dec.choices[1].message and dec.choices[1].message.content then
+                content=dec.choices[1].message.content
+            elseif dec.content and dec.content[1] and dec.content[1].text then
+                content=dec.content[1].text
+            end
+            if not content then addMessage("system","Resposta sem content.",true) return end
+            addMessage("assistant",content)
+            table.insert(State.chatHistory,{role="assistant",content=content})
+        end)
+    end
+    sendBtn.MouseButton1Click:Connect(onSend)
+    inputBox.FocusLost:Connect(function(enter) if enter then onSend() end end)
+    clearBtn.MouseButton1Click:Connect(function() for _,c in ipairs(history:GetChildren()) do if c:IsA("Frame") then c:Destroy() end end State.chatHistory={} end)
+
+    local function updateActiveDisplay()
+        local p=getActiveProfile()
+        if p then profileBtn.Text=p.Name modelDisplay.Text=p.MODEL or "Selecione um modelo" else profileBtn.Text="Nenhum perfil" modelDisplay.Text="Selecione um modelo" end
+    end
+
+    -- ================= RScripts Tab =================
+    local searchRow=Instance.new("Frame") searchRow.Size=UDim2.new(1,0,0,32) searchRow.BackgroundTransparency=1 searchRow.Parent=pageRScripts
+    local searchBox=tbox(searchRow,"Pesquisar scripts...",UDim2.new(1,-86,0,28),false)
+    local searchBtn=btn(searchRow,"Pesquisar",UDim2.new(0,80,0,28),State.visual.accent) searchBtn.Position=UDim2.new(1,-80,0,0)
+    local filterRow=Instance.new("Frame") filterRow.Size=UDim2.new(1,0,0,28) filterRow.Position=UDim2.new(0,0,0,36) filterRow.BackgroundTransparency=1 filterRow.Parent=pageRScripts
+    local fLayout=Instance.new("UIListLayout") fLayout.FillDirection=Enum.FillDirection.Horizontal fLayout.Padding=UDim.new(0,6) fLayout.Parent=filterRow
+    local btnCurrent=btn(filterRow,"Jogo atual",UDim2.new(0,90,0,24),BG3) btnCurrent.TextSize=12
+    local btnEasy=btn(filterRow,"Mais fáceis",UDim2.new(0,90,0,24),BG3) btnEasy.TextSize=12
+    local placeLbl=lbl(filterRow,"PlaceId: "..tostring(game.PlaceId or 0),UDim2.new(0,160,0,24),11,TXTDIM)
+    local credit=lbl(pageRScripts,"Powered by Rscripts.net - https://rscripts.net/docs/api",UDim2.new(1,0,0,16),10,TXTDIM) credit.Position=UDim2.new(0,0,1,-16)
+    local results=Instance.new("ScrollingFrame") results.Size=UDim2.new(1,0,1,-88) results.Position=UDim2.new(0,0,0,68) results.BackgroundColor3=BG2 results.BackgroundTransparency=0.2 results.BorderSizePixel=0 results.CanvasSize=UDim2.new(0,0,0,0) results.AutomaticCanvasSize=Enum.AutomaticSize.Y results.ScrollBarThickness=4 results.Parent=pageRScripts corner(results,6) stroke(results,BG3,1)
+    local rLayout=Instance.new("UIListLayout") rLayout.Padding=UDim.new(0,6) rLayout.Parent=results
+    local rPad=Instance.new("UIPadding") setPadAll(rPad, UDim.new(0,6) rPad.Parent=results)
+
+    local function clearResults() for _,c in ipairs(results:GetChildren()) do if c:IsA("Frame") then c:Destroy() end end end
+    local function showStatus(txt) clearResults() lbl(results,txt,UDim2.new(1,0,0,24),12,TXTDIM) end
+
+    local function createCard(data)
+        local card=Instance.new("Frame") card.Size=UDim2.new(1,-6,0,110) card.AutomaticSize=Enum.AutomaticSize.Y card.BackgroundColor3=BG3 card.BorderSizePixel=0 card.Parent=results corner(card,6) stroke(card,BG2,1)
+        local t=lbl(card,data.title or "Sem título",UDim2.new(1,-12,0,20),13,TXT) t.Position=UDim2.new(0,6,0,4) t.Font=Enum.Font.GothamBold
+        local s=lbl(card,"slug: "..(data.slug or "?"),UDim2.new(1,-12,0,14),10,TXTDIM) s.Position=UDim2.new(0,6,0,24)
+        local aName=data.creator and data.creator.username or "?" 
+        local au=lbl(card,"Autor: "..aName,UDim2.new(1,-12,0,14),10,TXTDIM) au.Position=UDim2.new(0,6,0,38)
+        local d=lbl(card,(data.description or ""):sub(1,180),UDim2.new(1,-12,0,0),11,TXT) d.Position=UDim2.new(0,6,0,52) d.AutomaticSize=Enum.AutomaticSize.Y
+        local stats="" if data.views then stats=stats.."Views:"..data.views.." " end if data.likes then stats=stats.."Likes:"..data.likes.." " end if data.risk then stats=stats.."Risk:"..tostring(data.risk.score or "?").."("..(data.risk.level or "?")..") " end if data.isKeySystem~=nil then stats=stats.."Key:"..(data.isKeySystem and "Sim" or "Nao").." " end if data.isPaid~=nil then stats=stats..(data.isPaid and "Pago" or "Gratuito") end
+        local st=lbl(card,stats,UDim2.new(1,-12,0,0),10,TXTDIM) st.Position=UDim2.new(0,6,0,0) st.AutomaticSize=Enum.AutomaticSize.Y
+        task.spawn(function() task.wait() local y=4+20+14+14 st.Position=UDim2.new(0,6,0,52+d.TextBounds.Y+4) y=52+d.TextBounds.Y+4+st.TextBounds.Y+30 card.Size=UDim2.new(1,-6,0,y) end)
+        local row=Instance.new("Frame") row.Size=UDim2.new(1,-12,0,26) row.Position=UDim2.new(0,6,1,-28) row.BackgroundTransparency=1 row.Parent=card
+        local cp=btn(row,"Copiar",UDim2.new(0,60,0,22),BG2) cp.TextSize=11
+        local send=btn(row,"Enviar à IA",UDim2.new(0,90,0,22),State.visual.accent) send.Position=UDim2.new(0,66,0,0) send.TextSize=11
+        cp.MouseButton1Click:Connect(function()
+            cp.Text="..." task.spawn(function()
+                local ok, dec = rscriptsRequest("/v1/scripts/"..HttpService:UrlEncode(data.slug), {})
+                if not ok then cp.Text="Erro" task.wait(1.5) cp.Text="Copiar" addMessage("system","Falha: "..tostring(dec),true) return end
+                local code = dec.data and dec.data.script or nil
+                local raw = dec.data and dec.data.rawScript or nil
+                if not code or code=="" then if raw and raw~="" then local ok2, body = pcall(function() local r=httpRequest({Url=raw, Method="GET"}) return r.Success and r.Body or nil end) if ok2 and body then code=body end end end
+                if not code or code=="" then cp.Text="Sem código" task.wait(1.5) cp.Text="Copiar" return end
+                if clipboardFunc then pcall(function() clipboardFunc(code) end) cp.Text="Copiado!" else cp.Text="Sem clipboard" end
+                task.wait(1.5) cp.Text="Copiar"
+            end)
+        end)
+        send.MouseButton1Click:Connect(function()
+            send.Text="..." task.spawn(function()
+                local ok, dec = rscriptsRequest("/v1/scripts/"..HttpService:UrlEncode(data.slug), {})
+                if not ok then send.Text="Erro" task.wait(1) send.Text="Enviar à IA" addMessage("system","Falha: "..tostring(dec),true) return end
+                local code = dec.data and dec.data.script or nil
+                local raw = dec.data and dec.data.rawScript or nil
+                if not code or code=="" then if raw and raw~="" then local r=httpRequest({Url=raw, Method="GET"}) if r.Success then code=r.Body end end end
+                if not code or code=="" then send.Text="Sem código" task.wait(1) send.Text="Enviar à IA" return end
+                local prof=getActiveProfile() local vok, verr=validateProfile(prof) if not vok then addMessage("system",verr,true) setTab("Chat") send.Text="Enviar à IA" return end
+                inputBox.Text="Analise este script do RScripts. Explique o que ele faz, identifique riscos e descreva as partes importantes. Não execute nada automaticamente:\n\n-- "..(data.title or "").."\n\n"..code
+                setTab("Chat") addMessage("system","Script carregado para análise. Clique Enviar.",false) send.Text="Enviado" task.wait(1) send.Text="Enviar à IA"
+            end)
+        end)
+        local pad=Instance.new("Frame") pad.Size=UDim2.new(1,0,0,28) pad.BackgroundTransparency=1 pad.Parent=card
+    end
+
+    local function handleResults(ok, dec)
+        searchBtn.Text="Pesquisar" searchBtn.AutoButtonColor=true
+        if not ok then showStatus("Erro: "..tostring(dec)) return end
+        local scripts={}
+        if dec.data then if dec.data.scripts then scripts=dec.data.scripts elseif dec.data[1] then scripts=dec.data end end
+        if #scripts==0 then showStatus("Nenhum resultado.") return end
+        clearResults() for _,s in ipairs(scripts) do createCard(s) end
+    end
+
+    searchBtn.MouseButton1Click:Connect(function()
+        local q=searchBox.Text if not q or q:gsub("%s","")=="" then showStatus("Digite algo.") return end
+        searchBtn.Text="..." searchBtn.AutoButtonColor=false
+        task.spawn(function() local ok, dec = rscriptsRequest("/v1/search", {q=q, index="scripts", limit=12}) handleResults(ok,dec) end)
+    end)
+    btnCurrent.MouseButton1Click:Connect(function()
+        local pid=game.PlaceId if not pid or pid==0 then showStatus("Não foi possível identificar o jogo atual.") return end
+        placeLbl.Text="PlaceId: "..tostring(pid) btnCurrent.Text="..."
+        task.spawn(function() local ok, dec = rscriptsRequest("/v1/scripts", {placeId=tostring(pid), limit=20, sort="most-likes"}) btnCurrent.Text="Jogo atual" handleResults(ok,dec) end)
+    end)
+    btnEasy.MouseButton1Click:Connect(function()
+        local pid=game.PlaceId if not pid or pid==0 then showStatus("Não foi possível identificar o jogo atual.") return end
+        placeLbl.Text="PlaceId: "..tostring(pid) btnEasy.Text="..."
+        task.spawn(function() local ok, dec = rscriptsRequest("/v1/scripts", {placeId=tostring(pid), limit=20, sort="most-likes", noKeySystem="true", freeOnly="true"}) btnEasy.Text="Mais fáceis" handleResults(ok,dec) end)
+    end)
+
+    -- ================= Settings Tab =================
+    local scroll=Instance.new("ScrollingFrame") scroll.Size=UDim2.new(1,0,1,0) scroll.BackgroundTransparency=1 scroll.CanvasSize=UDim2.new(0,0,0,0) scroll.AutomaticCanvasSize=Enum.AutomaticSize.Y scroll.ScrollBarThickness=4 scroll.Parent=pageSettings
+    local sl=Instance.new("UIListLayout") sl.Padding=UDim.new(0,8) sl.Parent=scroll
+    local sp=Instance.new("UIPadding") setPadAll(sp, UDim.new(0,6) sp.Parent=scroll)
+
+    local warnF=Instance.new("Frame") warnF.Size=UDim2.new(1,-6,0,40) warnF.BackgroundColor3=Color3.fromRGB(50,30,0) warnF.Parent=scroll corner(warnF,6) stroke(warnF,State.visual.accent,1,0.5)
+    lbl(warnF,"API Keys colocadas em um script local podem ser extraídas pelo ambiente de execução. Não compartilhe suas chaves.",UDim2.new(1,-10,1,-10),11,Color3.fromRGB(255,200,100)).Position=UDim2.new(0,5,0,5)
+
+    local rSec=Instance.new("Frame") rSec.Size=UDim2.new(1,-6,0,70) rSec.BackgroundColor3=BG2 rSec.Parent=scroll corner(rSec,6)
+    local rL=Instance.new("UIListLayout") rL.Padding=UDim.new(0,4) rL.Parent=rSec local rP=Instance.new("UIPadding") setPadAll(rP, UDim.new(0,6) rP.Parent=rSec)
+    lbl(rSec,"RScripts API Key",UDim2.new(1,0,0,18),12,TXT).Font=Enum.Font.GothamBold
+    local rBox=tbox(rSec,"rsc_live_...",UDim2.new(1,0,0,28),false) rBox.Text=State.rscriptsApiKey
+    rBox.FocusLost:Connect(function() State.rscriptsApiKey=rBox.Text Storage:save() end)
+
+    local sysSec=Instance.new("Frame") sysSec.Size=UDim2.new(1,-6,0,110) sysSec.BackgroundColor3=BG2 sysSec.Parent=scroll corner(sysSec,6)
+    local sL=Instance.new("UIListLayout") sL.Padding=UDim.new(0,4) sL.Parent=sysSec local sP=Instance.new("UIPadding") setPadAll(sP, UDim.new(0,6) sP.Parent=sysSec)
+    lbl(sysSec,"System Prompt",UDim2.new(1,0,0,18),12,TXT).Font=Enum.Font.GothamBold
+    local sysBox=tbox(sysSec,"Instruções para a IA...",UDim2.new(1,0,0,70),true) sysBox.Text=State.systemPrompt sysBox.TextYAlignment=Enum.TextYAlignment.Top
+    sysBox.FocusLost:Connect(function() State.systemPrompt=sysBox.Text Storage:save() end)
+
+    -- Perfis
+    local profSec=Instance.new("Frame") profSec.Size=UDim2.new(1,-6,0,0) profSec.AutomaticSize=Enum.AutomaticSize.Y profSec.BackgroundColor3=BG2 profSec.Parent=scroll corner(profSec,6)
+    local pL=Instance.new("UIListLayout") pL.Padding=UDim.new(0,6) pL.Parent=profSec local pP=Instance.new("UIPadding") setPadAll(pP, UDim.new(0,6) pP.Parent=profSec)
+    lbl(profSec,"Perfis de IA",UDim2.new(1,0,0,18),12,TXT).Font=Enum.Font.GothamBold
+    local listF=Instance.new("Frame") listF.Size=UDim2.new(1,0,0,0) listF.AutomaticSize=Enum.AutomaticSize.Y listF.BackgroundTransparency=1 listF.Parent=profSec
+    local listL=Instance.new("UIListLayout") listL.Padding=UDim.new(0,4) listL.Parent=listF
+    local createBtn=btn(profSec,"+ Criar Perfil",UDim2.new(1,0,0,28),State.visual.accent)
+
+    local form=Instance.new("Frame") form.Size=UDim2.new(1,0,0,0) form.AutomaticSize=Enum.AutomaticSize.Y form.BackgroundColor3=BG3 form.Visible=false form.Parent=profSec corner(form,6) stroke(form,State.visual.accent,1)
+    local fL=Instance.new("UIListLayout") fL.Padding=UDim.new(0,4) fL.Parent=form local fP=Instance.new("UIPadding") setPadAll(fP, UDim.new(0,6) fP.Parent=form)
+    lbl(form,"Novo Perfil",UDim2.new(1,0,0,18),12,TXT).Font=Enum.Font.GothamBold
+    local nameBox=tbox(form,"Nome do perfil",UDim2.new(1,0,0,28),false)
+    local urlBox=tbox(form,"API URL",UDim2.new(1,0,0,28),false)
+    local keyBox=tbox(form,"API Key",UDim2.new(1,0,0,28),false)
+    local provRow=Instance.new("Frame") provRow.Size=UDim2.new(1,0,0,28) provRow.BackgroundTransparency=1 provRow.Parent=form
+    lbl(provRow,"Provedor:",UDim2.new(0,70,1,0),11,TXTDIM)
+    local provBtn=btn(provRow,"Selecione provedor",UDim2.new(1,-76,1,0),BG2) provBtn.Position=UDim2.new(0,76,0,0) provBtn.TextSize=12
+    local provList=Instance.new("ScrollingFrame") provList.Size=UDim2.new(0,180,0,150) provList.Position=UDim2.new(0,76,0,28) provList.BackgroundColor3=BG2 provList.Visible=false provList.ZIndex=30 provList.CanvasSize=UDim2.new(0,0,0,0) provList.AutomaticCanvasSize=Enum.AutomaticSize.Y provList.ScrollBarThickness=4 provList.Parent=provRow corner(provList,6) stroke(provList,State.visual.accent,1)
+    local provL=Instance.new("UIListLayout") provL.Parent=provList
+    local selectedProvider=nil
+    local modelSearch=tbox(form,"Pesquisar modelo...",UDim2.new(1,0,0,28),false)
+    local mRow=Instance.new("Frame") mRow.Size=UDim2.new(1,0,0,28) mRow.BackgroundTransparency=1 mRow.Parent=form
+    lbl(mRow,"Modelo:",UDim2.new(0,60,1,0),11,TXTDIM)
+    local modelBtn=btn(mRow,"Selecione um modelo",UDim2.new(1,-66,1,0),BG2) modelBtn.Position=UDim2.new(0,66,0,0) modelBtn.TextSize=12
+    local modelList=Instance.new("ScrollingFrame") modelList.Size=UDim2.new(1,0,0,200) modelList.BackgroundColor3=BG2 modelList.Visible=false modelList.ZIndex=25 modelList.CanvasSize=UDim2.new(0,0,0,0) modelList.AutomaticCanvasSize=Enum.AutomaticSize.Y modelList.ScrollBarThickness=4 modelList.Parent=form corner(modelList,6) stroke(modelList,State.visual.accent,1)
+    local mListL=Instance.new("UIListLayout") mListL.Padding=UDim.new(0,2) mListL.Parent=modelList
+    local selectedModel=nil
+
+    local actions=Instance.new("Frame") actions.Size=UDim2.new(1,0,0,28) actions.BackgroundTransparency=1 actions.Parent=form
+    local aL=Instance.new("UIListLayout") aL.FillDirection=Enum.FillDirection.Horizontal aL.Padding=UDim.new(0,6) aL.Parent=actions
+    local updBtn=btn(actions,"Atualizar modelos",UDim2.new(0,120,0,24),BG2) updBtn.TextSize=11
+    local custBtn=btn(actions,"+ Modelo personalizado",UDim2.new(0,150,0,24),BG2) custBtn.TextSize=11
+
+    local custFrame=Instance.new("Frame") custFrame.Size=UDim2.new(1,0,0,0) custFrame.AutomaticSize=Enum.AutomaticSize.Y custFrame.BackgroundColor3=Color3.fromRGB(35,35,35) custFrame.Visible=false custFrame.Parent=form corner(custFrame,6)
+    local cL=Instance.new("UIListLayout") cL.Padding=UDim.new(0,4) cL.Parent=custFrame local cP=Instance.new("UIPadding") setPadAll(cP, UDim.new(0,6) cP.Parent=custFrame)
+    lbl(custFrame,"Modelo personalizado",UDim2.new(1,0,0,18),11,TXT).Font=Enum.Font.GothamBold
+    local cName=tbox(custFrame,"Nome",UDim2.new(1,0,0,24),false)
+    local cId=tbox(custFrame,"Model ID",UDim2.new(1,0,0,24),false)
+    local cProv=tbox(custFrame,"Provedor",UDim2.new(1,0,0,24),false)
+    local cPrice=btn(custFrame,"Preço: Desconhecido",UDim2.new(1,0,0,24),BG2) cPrice.TextSize=11
+    local cUrl=tbox(custFrame,"API URL (opcional)",UDim2.new(1,0,0,24),false)
+    local cSave=btn(custFrame,"Salvar modelo personalizado",UDim2.new(1,0,0,26),State.visual.accent)
+    local priceOpts={"Gratuito","Pago","Desconhecido"} local priceIdx=3
+    cPrice.MouseButton1Click:Connect(function() priceIdx=priceIdx%#priceOpts+1 cPrice.Text="Preço: "..priceOpts[priceIdx] end)
+
+    local btnRow=Instance.new("Frame") btnRow.Size=UDim2.new(1,0,0,28) btnRow.BackgroundTransparency=1 btnRow.Parent=form
+    local bL=Instance.new("UIListLayout") bL.FillDirection=Enum.FillDirection.Horizontal bL.Padding=UDim.new(0,6) bL.Parent=btnRow
+    local saveBtn=btn(btnRow,"Salvar",UDim2.new(0,80,0,26),State.visual.accent)
+    local cancelBtn=btn(btnRow,"Cancelar",UDim2.new(0,80,0,26),BG2)
+
+    local editingId=nil
+
+    local function getAllModels()
+        local all={}
+        for prov,list in pairs(Config.ModelsCatalog) do for _,m in ipairs(list) do table.insert(all,{id=m.id,name=m.name or m.id,provider=prov,price=m.price or "Unknown",isCustom=false}) end end
+        for _,cm in ipairs(State.customModels) do table.insert(all,{id=cm.id,name=cm.name,provider=cm.provider or "Outros",price=cm.price or "Unknown",isCustom=true}) end
+        return all
+    end
+    local function isFav(id) return State.favorites[id]==true end
+    local function toggleFav(id) if State.favorites[id] then State.favorites[id]=nil else State.favorites[id]=true end Storage:save() end
+
+    local function refreshModelList()
+        for _,c in ipairs(modelList:GetChildren()) do if c:IsA("Frame") or c:IsA("TextButton") or c:IsA("TextLabel") then if c.Name~="UIListLayout" then c:Destroy() end end end
+        local search=string.lower(modelSearch.Text or "")
+        local all=getAllModels()
+        local filtered={}
+        for _,m in ipairs(all) do if search=="" or string.lower(m.id):find(search,1,true) or string.lower(m.name):find(search,1,true) or string.lower(m.provider):find(search,1,true) then table.insert(filtered,m) end end
+        local groups={
+            {name="[FAVORITOS]", key="fav", models={}},
+            {name="[PROVEDOR: "..(selectedProvider or "TODOS").."]", key="prov", models={}},
+            {name="[GRATUITOS]", key="free", models={}},
+            {name="[PAGOS]", key="paid", models={}},
+            {name="[OUTROS]", key="other", models={}},
+            {name="[PERSONALIZADOS]", key="custom", models={}},
+        }
+        for _,m in ipairs(filtered) do
+            if isFav(m.id) then table.insert(groups[1].models,m)
+            elseif selectedProvider and m.provider==selectedProvider then table.insert(groups[2].models,m)
+            elseif m.isCustom then table.insert(groups[6].models,m)
+            elseif m.price=="Free" or m.price=="Gratuito" then table.insert(groups[3].models,m)
+            elseif m.price=="Paid" or m.price=="Pago" then table.insert(groups[4].models,m)
+            else table.insert(groups[5].models,m) end
+        end
+        local maxShow=120 local shown=0
+        for _,g in ipairs(groups) do
+            if #g.models>0 and shown<maxShow then
+                if not (g.key=="prov" and not selectedProvider) then
+                    local h=lbl(modelList,g.name.." ("..#g.models..")",UDim2.new(1,0,0,20),11,State.visual.accent) h.Font=Enum.Font.GothamBold shown=shown+1
+                    table.sort(g.models,function(a,b) return a.name:lower()<b.name:lower() end)
+                    for _,m in ipairs(g.models) do
+                        if shown>=maxShow then break end
+                        local row=Instance.new("Frame") row.Size=UDim2.new(1,0,0,26) row.BackgroundColor3=BG3 row.Parent=modelList corner(row,4)
+                        lbl(row,m.name.." ("..m.id..") ["..m.price.."]",UDim2.new(1,-50,1,0),11,TXT).Position=UDim2.new(0,6,0,0)
+                        local fav=btn(row,isFav(m.id) and "*" or "+",UDim2.new(0,22,0,22),BG2) fav.Position=UDim2.new(1,-46,0,2) fav.TextSize=12 fav.MouseButton1Click:Connect(function() toggleFav(m.id) refreshModelList() end)
+                        local sel=btn(row,">",UDim2.new(0,22,0,22),State.visual.accent) sel.Position=UDim2.new(1,-22,0,2) sel.MouseButton1Click:Connect(function() selectedModel=m.id modelBtn.Text=m.id modelList.Visible=false end)
+                        shown=shown+1
+                    end
+                end
+            end
+        end
+        if shown==0 then lbl(modelList,"Nenhum modelo. Use pesquisa ou personalizado.",UDim2.new(1,0,0,24),11,TXTDIM) end
+    end
+
+    provBtn.MouseButton1Click:Connect(function() provList.Visible=not provList.Visible end)
+    for _,prov in ipairs(Config.Providers) do
+        local b=btn(provList,prov,UDim2.new(1,-4,0,24),BG3) b.TextSize=12
+        b.MouseButton1Click:Connect(function() selectedProvider=prov provBtn.Text=prov provList.Visible=false if urlBox.Text=="" then local sug=Config.ProviderAPIUrls[prov] if sug and sug~="" then urlBox.Text=sug end end refreshModelList() end)
+    end
+    modelBtn.MouseButton1Click:Connect(function() refreshModelList() modelList.Visible=not modelList.Visible end)
+    modelSearch:GetPropertyChangedSignal("Text"):Connect(function() if modelList.Visible then refreshModelList() end end)
+    custBtn.MouseButton1Click:Connect(function() custFrame.Visible=not custFrame.Visible end)
+    cSave.MouseButton1Click:Connect(function()
+        if cId.Text=="" or cName.Text=="" then return end
+        local map={Gratuito="Free", Pago="Paid", Desconhecido="Unknown"}
+        local price=map[priceOpts[priceIdx]] or "Unknown"
+        table.insert(State.customModels,{id=cId.Text,name=cName.Text,provider=cProv.Text~="" and cProv.Text or "Outros",price=price,apiUrl=cUrl.Text})
+        Storage:save() custFrame.Visible=false cName.Text="" cId.Text="" cProv.Text="" cUrl.Text="" refreshModelList()
+    end)
+
+    updBtn.MouseButton1Click:Connect(function()
+        updBtn.Text="..." task.spawn(function()
+            if not selectedProvider then updBtn.Text="Selecione provedor" task.wait(1.5) updBtn.Text="Atualizar modelos" return end
+            if selectedProvider=="OpenRouter" then
+                local prof=getActiveProfile() local key=prof and prof.Provider=="OpenRouter" and prof.API_KEY or nil
+                local headers={} if key then headers["Authorization"]="Bearer "..key end
+                local res=httpRequest({Url="https://openrouter.ai/api/v1/models", Method="GET", Headers=headers})
+                if res.Success then
+                    local ok, dec=pcall(function() return HttpService:JSONDecode(res.Body) end)
+                    if ok and dec and dec.data then
+                        local cnt=0
+                        for _,m in ipairs(dec.data) do
+                            local exists=false for _,e in ipairs(State.customModels) do if e.id==m.id then exists=true break end end
+                            if not exists then
+                                local prov="Outros" if m.id:find("openai") then prov="OpenAI" elseif m.id:find("gemini") then prov="Google Gemini" elseif m.id:find("deepseek") then prov="DeepSeek" elseif m.id:find("claude") then prov="Anthropic" elseif m.id:find("qwen") then prov="Qwen" elseif m.id:find("mistral") then prov="Mistral" elseif m.id:find("llama") then prov="Meta / Llama" elseif m.id:find("grok") then prov="xAI / Grok" end
+                                local price="Unknown" if m.pricing and m.pricing.prompt=="0" then price="Free" else price="Paid" end
+                                table.insert(State.customModels,{id=m.id,name=m.name or m.id,provider=prov,price=price}) cnt=cnt+1
+                            end
+                        end
+                        Storage:save() updBtn.Text="Atualizados "..cnt refreshModelList() task.wait(2) updBtn.Text="Atualizar modelos" return
+                    end
+                end
+                updBtn.Text="Falha" task.wait(1.5) updBtn.Text="Atualizar modelos" return
+            end
+            -- OpenAI compat /models
+            local base=urlBox.Text~="" and urlBox.Text or Config.ProviderAPIUrls[selectedProvider] or ""
+            local mUrl=nil
+            if base:find("/chat/completions") then mUrl=base:gsub("/chat/completions","/models")
+            else local origin=base:match("^(https?://[^/]+)") if origin then mUrl=origin.."/v1/models" end end
+            if not mUrl then updBtn.Text="Sem endpoint" task.wait(1.5) updBtn.Text="Atualizar modelos" return end
+            local key=keyBox.Text~="" and keyBox.Text or (getActiveProfile() and getActiveProfile().API_KEY) or ""
+            local headers={} if key~="" then headers["Authorization"]="Bearer "..key end
+            local res=httpRequest({Url=mUrl, Method="GET", Headers=headers})
+            if res.Success then
+                local ok, dec=pcall(function() return HttpService:JSONDecode(res.Body) end)
+                if ok and dec then
+                    local list=dec.data or dec.models or {}
+                    local cnt=0
+                    for _,m in ipairs(list) do
+                        local id=m.id or m.name
+                        if id then
+                            local exists=false for _,cat in pairs(Config.ModelsCatalog) do for _,cm in ipairs(cat) do if cm.id==id then exists=true break end end if exists then break end end if not exists then for _,cm in ipairs(State.customModels) do if cm.id==id then exists=true break end end end
+                            if not exists then table.insert(State.customModels,{id=id,name=m.name or id,provider=selectedProvider,price="Unknown"}) cnt=cnt+1 end
+                        end
+                    end
+                    Storage:save() updBtn.Text="Atualizados "..cnt refreshModelList() task.wait(2) updBtn.Text="Atualizar modelos" return
+                end
+            end
+            updBtn.Text="Falha" task.wait(1.5) updBtn.Text="Atualizar modelos"
+        end)
+    end)
+
+    local function refreshProfiles()
+        for _,c in ipairs(listF:GetChildren()) do if c:IsA("Frame") then c:Destroy() end end
+        for _,p in ipairs(State.profiles) do
+            local row=Instance.new("Frame") row.Size=UDim2.new(1,0,0,36) row.BackgroundColor3=BG3 row.Parent=listF corner(row,6)
+            lbl(row,p.Name.." | "..(p.Provider or "?").." | "..(p.MODEL or "sem modelo"),UDim2.new(1,-130,1,0),11,TXT).Position=UDim2.new(0,6,0,0)
+            local use=btn(row,"Usar",UDim2.new(0,40,0,22),State.visual.accent) use.Position=UDim2.new(1,-120,0,7) use.TextSize=11
+            use.MouseButton1Click:Connect(function() State.activeProfileId=p.id Storage:save() updateActiveDisplay() use.Text="Ativo" task.wait(1) use.Text="Usar" end)
+            local edit=btn(row,"E",UDim2.new(0,22,0,22),BG2) edit.Position=UDim2.new(1,-72,0,7) edit.TextSize=11
+            edit.MouseButton1Click:Connect(function() editingId=p.id nameBox.Text=p.Name urlBox.Text=p.API_URL keyBox.Text=p.API_KEY selectedProvider=p.Provider provBtn.Text=p.Provider or "Selecione provedor" selectedModel=p.MODEL modelBtn.Text=p.MODEL or "Selecione um modelo" form.Visible=true end)
+            local del=btn(row,"X",UDim2.new(0,22,0,22),Color3.fromRGB(120,30,30)) del.Position=UDim2.new(1,-30,0,7) del.TextSize=11
+            del.MouseButton1Click:Connect(function() for i,pr in ipairs(State.profiles) do if pr.id==p.id then table.remove(State.profiles,i) break end end if State.activeProfileId==p.id then State.activeProfileId=nil end Storage:save() refreshProfiles() refreshProfileDropdown() updateActiveDisplay() end)
+        end
+        if #State.profiles==0 then lbl(listF,"Nenhum perfil criado.",UDim2.new(1,0,0,24),11,TXTDIM) end
+    end
+
+    createBtn.MouseButton1Click:Connect(function() editingId=nil nameBox.Text="" urlBox.Text="" keyBox.Text="" selectedProvider=nil provBtn.Text="Selecione provedor" selectedModel=nil modelBtn.Text="Selecione um modelo" modelSearch.Text="" form.Visible=not form.Visible end)
+    cancelBtn.MouseButton1Click:Connect(function() form.Visible=false editingId=nil end)
+    saveBtn.MouseButton1Click:Connect(function()
+        if nameBox.Text:gsub("%s","")=="" then return end
+        local model=modelBtn.Text if model=="Selecione um modelo" then model="" end
+        if selectedModel then model=selectedModel end
+        if editingId then
+            for _,p in ipairs(State.profiles) do if p.id==editingId then p.Name=nameBox.Text p.API_URL=urlBox.Text p.API_KEY=keyBox.Text p.Provider=selectedProvider or "Outros" p.MODEL=model break end end
+        else
+            local id=HttpService:GenerateGUID(false)
+            table.insert(State.profiles,{id=id, Name=nameBox.Text, API_URL=urlBox.Text, API_KEY=keyBox.Text, Provider=selectedProvider or "Outros", MODEL=model})
+            State.activeProfileId=id
+        end
+        Storage:save() form.Visible=false editingId=nil refreshProfiles() refreshProfileDropdown() updateActiveDisplay()
+    end)
+
+    refreshProfiles()
+    refreshProfileDropdown()
+    updateActiveDisplay()
+    if #State.profiles==0 then addMessage("system","Configure a IA que você vai usar nas configurações.",true) end
+
+    setTab("Chat")
+    return sg
+end
+
+-- Init
+local function init()
+    Storage:load()
+    local ok, guiOrErr = pcall(createGui)
+    if not ok then
+        warn("[AIChat] Erro ao criar GUI: "..tostring(guiOrErr))
+        -- tenta mostrar erro simples no PlayerGui
+        pcall(function()
+            local pg = LocalPlayer and LocalPlayer:FindFirstChildOfClass("PlayerGui")
+            if pg then
+                local sg = Instance.new("ScreenGui") sg.Name="AIChat_Error" sg.Parent=pg
+                local f = Instance.new("Frame") f.Size=UDim2.new(0,300,0,100) f.Position=UDim2.new(0.5,-150,0.5,-50) f.BackgroundColor3=Color3.fromRGB(30,30,30) f.Parent=sg
+                local l = Instance.new("TextLabel") l.Size=UDim2.new(1,-20,1,-20) l.Position=UDim2.new(0,10,0,10) l.BackgroundTransparency=1 l.Text="AIChat erro: "..tostring(guiOrErr) l.TextColor3=Color3.new(1,1,1) l.TextWrapped=true l.Parent=f
+            end
+        end)
+    else
+        print("[AIChat] Inicializado OK - Perfis:", #State.profiles)
+    end
+end
+
+task.spawn(function()
+    local ok, err = pcall(init)
+    if not ok then warn("[AIChat] Falha init: "..tostring(err)) end
+end)
