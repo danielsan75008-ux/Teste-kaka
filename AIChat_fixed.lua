@@ -172,8 +172,11 @@ Config.RScriptsBase = "https://api.rscripts.net"
 local State = {
     profiles = {},
     activeProfileId = nil,
-    systemPrompt = "",
-    rscriptsApiKey = "",
+    systemPrompt = "Você é um assistente especializado em programação Lua para Roblox.
+Responda em português.
+Seja direto e explique os erros no código.
+Nunca execute código automaticamente.Você é um especialista em LuaU Roblox",
+    rscriptsApiKey = "rsc_live_SyIJb6i8oRHyCtizUPKIpAG6b5ZaJLsU",
     favorites = {},
     customModels = {},
     chatHistory = {},
